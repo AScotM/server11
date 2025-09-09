@@ -35,7 +35,7 @@ class Config:
     host: str = os.getenv("TCP_SERVER_HOST", "0.0.0.0")
     port: int = int(os.getenv("TCP_SERVER_PORT", "3333"))
     ws_port: int = int(os.getenv("WS_PORT", "3334"))
-    static_dir: Path = Path(".")
+    static_dir: Path = Path(os.getenv("STATIC_DIR", "."))
     cors_origin: str = os.getenv("CORS_ALLOWED_ORIGIN", "*")
     max_request_size: int = 1024 * 1024
     allowed_extensions: Tuple[str, ...] = ('.html', '.js', '.css', '.png', '.ico', '.json')
@@ -44,7 +44,9 @@ class Config:
     server_version: str = os.getenv("SERVER_VERSION", "2.0.0")
     ws_rate_limit_requests: int = int(os.getenv("WS_RATE_LIMIT_REQUESTS", "10"))
     ws_rate_limit_window: int = int(os.getenv("WS_RATE_LIMIT_WINDOW", "60"))
-    ws_auth_token: str = os.getenv("WS_AUTH_TOKEN", "secret-token")  # Added for WebSocket authentication
+    ws_auth_token: str = os.getenv("WS_AUTH_TOKEN", "secret-token")
+    cache_duration: float = float(os.getenv("CACHE_DURATION", "0.5"))
+    config_file: Optional[str] = os.getenv("CONFIG_FILE")
 
     def __post_init__(self):
         """Validate configuration parameters."""
@@ -54,29 +56,45 @@ class Config:
             raise ValueError(f"Static directory {self.static_dir} does not exist or is not a directory")
         if self.cors_origin != "*" and not re.match(r'^https?://[\w\-\.]+(:\d+)?$', self.cors_origin):
             raise ValueError(f"Invalid CORS origin: {self.cors_origin}")
+        if self.cache_duration <= 0:
+            raise ValueError(f"Invalid cache duration: {self.cache_duration}")
+        if self.config_file:
+            self._load_config_file()
+
+    def _load_config_file(self):
+        """Load configuration from a JSON file, if specified."""
+        try:
+            with open(self.config_file, 'r', encoding='utf-8') as f:
+                config_data = json.load(f)
+                for key, value in config_data.items():
+                    if hasattr(self, key):
+                        object.__setattr__(self, key, value)
+        except Exception as e:
+            raise ValueError(f"Failed to load config file {self.config_file}: {str(e)}")
 
 class RateLimiter:
-    """Rate limiter for HTTP and WebSocket requests."""
+    """Rate limiter for HTTP and WebSocket requests with endpoint-specific tracking."""
     def __init__(self, requests: int, window: int):
         self.requests = requests
         self.window = window
-        self.clients: Dict[str, List[datetime]] = defaultdict(list)
+        self.clients: Dict[Tuple[str, str], List[datetime]] = defaultdict(list)
 
-    def is_allowed(self, client_ip: str) -> bool:
-        """Check if a client is allowed to make a request."""
+    def is_allowed(self, client_ip: str, endpoint: str) -> bool:
+        """Check if a client is allowed to make a request for a specific endpoint."""
+        key = (client_ip, endpoint)
         now = datetime.now()
-        self.clients[client_ip] = [
-            t for t in self.clients[client_ip]
+        self.clients[key] = [
+            t for t in self.clients[key]
             if now - t < timedelta(seconds=self.window)
         ]
-        if len(self.clients[client_ip]) >= self.requests:
+        if len(self.clients[key]) >= self.requests:
             return False
-        self.clients[client_ip].append(now)
+        self.clients[key].append(now)
         return True
 
 class TCPStateCache:
     """Cache for TCP state parsing to reduce I/O."""
-    def __init__(self, cache_duration: float = 0.5):
+    def __init__(self, cache_duration: float):
         self.cache_duration = cache_duration
         self.last_update = 0.0
         self.cache = None
@@ -100,7 +118,7 @@ def parse_tcp_states() -> Dict[str, int]:
             with open(file, "r", encoding="utf-8") as f:
                 for line in f.readlines()[1:]:
                     parts = line.strip().split()
-                    if len(parts) < 4 or not re.match(r'^[0-9A-F]{2}$', parts[3]):
+                    if len(parts) < 12 or not re.match(r'^[0-9A-F]{2}$', parts[3]):
                         logging.warning({"message": f"Invalid line format in {file}", "line": line.strip()})
                         continue
                     state_code = parts[3]
@@ -115,11 +133,12 @@ def parse_tcp_states() -> Dict[str, int]:
 class TCPMonitoringHandler(SimpleHTTPRequestHandler):
     """HTTP request handler for TCP monitoring and static file serving."""
     
-    def __init__(self, *args, config: Config, rate_limiter: RateLimiter, server_start_time: float, tcp_cache: TCPStateCache, **kwargs):
+    def __init__(self, *args, config: Config, rate_limiter: RateLimiter, server_start_time: float, tcp_cache: TCPStateCache, ws_connection_count: callable, **kwargs):
         self.config = config
         self.rate_limiter = rate_limiter
         self.server_start_time = server_start_time
         self.tcp_cache = tcp_cache
+        self.ws_connection_count = ws_connection_count
         super().__init__(*args, directory=str(self.config.static_dir), **kwargs)
 
     def _send_response(self, content: bytes, content_type: str = "application/json", status: int = 200):
@@ -154,9 +173,10 @@ class TCPMonitoringHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         """Handle GET requests for TCP states, health checks, or static files."""
         try:
-            if not self.rate_limiter.is_allowed(self.client_address[0]):
+            endpoint = self.path.split('?', 1)[0] or "/"
+            if not self.rate_limiter.is_allowed(self.client_address[0], endpoint):
                 return self._handle_error(429, "Too Many Requests", 
-                    f"Rate limit exceeded: {self.config.rate_limit_requests} requests per {self.config.rate_limit_window} seconds")
+                    f"Rate limit exceeded: {self.config.rate_limit_requests} requests per {self.config.rate_limit_window} seconds for {endpoint}")
             
             if len(self.path) > 256:
                 return self._handle_error(414, "Request URI too long")
@@ -191,6 +211,8 @@ class TCPMonitoringHandler(SimpleHTTPRequestHandler):
                 "timestamp": int(time.time()),
                 "tcp_connections": sum(stats.values()),
                 "memory_usage": f"{psutil.virtual_memory().percent}%",
+                "cpu_usage": f"{psutil.cpu_percent(interval=None)}%",
+                "websocket_connections": self.ws_connection_count(),
                 "uptime": int(time.time() - self.server_start_time)
             }).encode("utf-8")
             self._send_response(response)
@@ -236,7 +258,7 @@ class TCPMonitoringHandler(SimpleHTTPRequestHandler):
             logging.error({"message": f"Static file handling error for {self.client_address[0]}", "error": str(e)})
             self._handle_error(500, "Internal server error", str(e))
 
-async def websocket_handler(websocket, path, config: Config, ws_rate_limiter: RateLimiter, tcp_cache: TCPStateCache):
+async def websocket_handler(websocket, path, config: Config, ws_rate_limiter: RateLimiter, tcp_cache: TCPStateCache, connection_count: callable):
     """Handle WebSocket connections for real-time TCP state updates."""
     client_ip = websocket.remote_address[0]
     logging.info({"message": f"WebSocket client connected", "client_ip": client_ip})
@@ -250,7 +272,7 @@ async def websocket_handler(websocket, path, config: Config, ws_rate_limiter: Ra
             await websocket.send(json.dumps({"error": "Unauthorized", "details": "Invalid or missing auth token"}))
             return
         
-        if not ws_rate_limiter.is_allowed(client_ip):
+        if not ws_rate_limiter.is_allowed(client_ip, path):
             await websocket.send(json.dumps({
                 "error": "Too Many Requests",
                 "details": f"WebSocket rate limit exceeded: {config.ws_rate_limit_requests} connections per {config.ws_rate_limit_window} seconds"
@@ -262,7 +284,8 @@ async def websocket_handler(websocket, path, config: Config, ws_rate_limiter: Ra
             response = json.dumps({ 
                 "timestamp": int(time.time()), 
                 "tcp_states": stats, 
-                "type": "tcp_state_update" 
+                "type": "tcp_state_update",
+                "server_version": config.server_version
             })
             await websocket.send(response)
             await asyncio.sleep(1)
@@ -270,9 +293,25 @@ async def websocket_handler(websocket, path, config: Config, ws_rate_limiter: Ra
         logging.info({"message": f"WebSocket connection closed", "client_ip": client_ip})
     except Exception as e:
         logging.error({"message": f"WebSocket error for {client_ip}", "error": str(e)})
+    finally:
+        connection_count.decrement()
+
+class ConnectionCounter:
+    """Track active WebSocket connections."""
+    def __init__(self):
+        self.count = 0
+
+    def increment(self):
+        self.count += 1
+
+    def decrement(self):
+        self.count = max(0, self.count - 1)
+
+    def get_count(self):
+        return self.count
 
 def configure_logging():
-    """Configure logging with rotation and structured JSON output."""
+    """Configure logging with rotation and dual JSON/human-readable output."""
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     
@@ -288,8 +327,12 @@ def configure_logging():
                 log_data["exception"] = self.formatException(record.exc_info)
             return json.dumps(log_data)
     
+    class HumanReadableFormatter(logging.Formatter):
+        def format(self, record):
+            return f"{self.formatTime(record, '%Y-%m-%d %H:%M:%S')} [{record.levelname}] {record.getMessage()}"
+
     stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(JSONFormatter())
+    stream_handler.setFormatter(HumanReadableFormatter())
     
     file_handler = RotatingFileHandler(
         "server.log",
@@ -321,7 +364,8 @@ async def run_server():
     
     server_start_time = time.time()
     config = Config()
-    tcp_cache = TCPStateCache()
+    tcp_cache = TCPStateCache(config.cache_duration)
+    connection_counter = ConnectionCounter()
     
     http_rate_limiter = RateLimiter(config.rate_limit_requests, config.rate_limit_window)
     ws_rate_limiter = RateLimiter(config.ws_rate_limit_requests, config.ws_rate_limit_window)
@@ -334,6 +378,7 @@ async def run_server():
                 rate_limiter=http_rate_limiter,
                 server_start_time=server_start_time,
                 tcp_cache=tcp_cache,
+                ws_connection_count=connection_counter.get_count,
                 **kwargs
             )
         
@@ -342,7 +387,7 @@ async def run_server():
         logger.info({"message": f"Serving static files", "directory": str(config.static_dir)})
         
         ws_server = await websockets.serve(
-            lambda ws, path: websocket_handler(ws, path, config, ws_rate_limiter, tcp_cache),
+            lambda ws, path: websocket_handler(ws, path, config, ws_rate_limiter, tcp_cache, connection_counter),
             config.host, 
             config.ws_port, 
             ping_interval=20, 
