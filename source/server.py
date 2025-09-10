@@ -9,7 +9,7 @@ import psutil
 from dataclasses import dataclass
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List, Set
 from collections import defaultdict
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
@@ -58,6 +58,10 @@ class Config:
             raise ValueError(f"Invalid CORS origin: {self.cors_origin}")
         if self.cache_duration <= 0:
             raise ValueError(f"Invalid cache duration: {self.cache_duration}")
+        if self.rate_limit_requests <= 0 or self.ws_rate_limit_requests <= 0:
+            raise ValueError("Rate limit requests must be positive")
+        if self.rate_limit_window <= 0 or self.ws_rate_limit_window <= 0:
+            raise ValueError("Rate limit window must be positive")
         if self.config_file:
             self._load_config_file()
 
@@ -109,7 +113,16 @@ class TCPStateCache:
 
 def parse_tcp_states() -> Dict[str, int]:
     """Parse TCP states from /proc/net/tcp and /proc/net/tcp6."""
-    files = ["/proc/net/tcp", "/proc/net/tcp6"]
+    files = []
+    if Path("/proc/net/tcp").exists():
+        files.append("/proc/net/tcp")
+    if Path("/proc/net/tcp6").exists():
+        files.append("/proc/net/tcp6")
+    
+    if not files:
+        logging.error({"message": "No TCP proc files found"})
+        return {name: 0 for name in TCP_STATES.values()}
+    
     state_count = {name: 0 for name in TCP_STATES.values()}
     state_count["UNKNOWN"] = 0
 
@@ -130,15 +143,43 @@ def parse_tcp_states() -> Dict[str, int]:
             logging.error({"message": f"Error parsing {file}", "error": str(e)})
     return state_count
 
+class ConnectionCounter:
+    """Track active WebSocket connections with proper management."""
+    def __init__(self):
+        self.count = 0
+        self.connections: Set[websockets.WebSocketServerProtocol] = set()
+
+    def add_connection(self, websocket: websockets.WebSocketServerProtocol):
+        """Add a WebSocket connection to tracking."""
+        self.connections.add(websocket)
+        self.count += 1
+
+    def remove_connection(self, websocket: websockets.WebSocketServerProtocol):
+        """Remove a WebSocket connection from tracking."""
+        if websocket in self.connections:
+            self.connections.remove(websocket)
+            self.count = max(0, self.count - 1)
+
+    def get_count(self) -> int:
+        """Get current connection count."""
+        return self.count
+
+    def close_all(self):
+        """Close all active WebSocket connections."""
+        for ws in self.connections:
+            asyncio.create_task(ws.close())
+        self.connections.clear()
+        self.count = 0
+
 class TCPMonitoringHandler(SimpleHTTPRequestHandler):
     """HTTP request handler for TCP monitoring and static file serving."""
     
-    def __init__(self, *args, config: Config, rate_limiter: RateLimiter, server_start_time: float, tcp_cache: TCPStateCache, ws_connection_count: callable, **kwargs):
+    def __init__(self, *args, config: Config, rate_limiter: RateLimiter, server_start_time: float, tcp_cache: TCPStateCache, connection_counter: ConnectionCounter, **kwargs):
         self.config = config
         self.rate_limiter = rate_limiter
         self.server_start_time = server_start_time
         self.tcp_cache = tcp_cache
-        self.ws_connection_count = ws_connection_count
+        self.connection_counter = connection_counter
         super().__init__(*args, directory=str(self.config.static_dir), **kwargs)
 
     def _send_response(self, content: bytes, content_type: str = "application/json", status: int = 200):
@@ -171,7 +212,7 @@ class TCPMonitoringHandler(SimpleHTTPRequestHandler):
         self._send_response(json.dumps(error_data).encode("utf-8"), status=status)
 
     def do_GET(self):
-        """Handle GET requests for TCP states, health checks, or static files."""
+        """Handle GET requests for TCP states, health checks, metrics, or static files."""
         try:
             endpoint = self.path.split('?', 1)[0] or "/"
             if not self.rate_limiter.is_allowed(self.client_address[0], endpoint):
@@ -185,6 +226,8 @@ class TCPMonitoringHandler(SimpleHTTPRequestHandler):
                 self._handle_tcp_states()
             elif self.path == "/health":
                 self._handle_health_check()
+            elif self.path == "/metrics":
+                self._handle_metrics()
             else:
                 self._handle_static()
         except Exception as e:
@@ -212,12 +255,35 @@ class TCPMonitoringHandler(SimpleHTTPRequestHandler):
                 "tcp_connections": sum(stats.values()),
                 "memory_usage": f"{psutil.virtual_memory().percent}%",
                 "cpu_usage": f"{psutil.cpu_percent(interval=None)}%",
-                "websocket_connections": self.ws_connection_count(),
-                "uptime": int(time.time() - self.server_start_time)
+                "websocket_connections": self.connection_counter.get_count(),
+                "uptime": int(time.time() - self.server_start_time),
+                "cache_hit": self.tcp_cache.cache is not None
             }).encode("utf-8")
             self._send_response(response)
         except Exception as e:
             self._handle_error(503, "Service unavailable", str(e))
+
+    def _handle_metrics(self):
+        """Handle metrics endpoint for monitoring."""
+        stats = self.tcp_cache.get_states()
+        metrics = [
+            f"# HELP tcp_connections_total Total TCP connections by state",
+            f"# TYPE tcp_connections_total gauge"
+        ]
+        
+        for state, count in stats.items():
+            metrics.append(f'tcp_connections_total{{state="{state}"}} {count}')
+        
+        metrics.extend([
+            f"# HELP websocket_connections_active Active WebSocket connections",
+            f"# TYPE websocket_connections_active gauge",
+            f'websocket_connections_active {self.connection_counter.get_count()}',
+            f"# HELP server_uptime_seconds Server uptime in seconds",
+            f"# TYPE server_uptime_seconds gauge",
+            f'server_uptime_seconds {int(time.time() - self.server_start_time)}'
+        ])
+        
+        self._send_response("\n".join(metrics).encode("utf-8"), "text/plain")
 
     def _handle_static(self):
         """Handle static file requests."""
@@ -258,10 +324,12 @@ class TCPMonitoringHandler(SimpleHTTPRequestHandler):
             logging.error({"message": f"Static file handling error for {self.client_address[0]}", "error": str(e)})
             self._handle_error(500, "Internal server error", str(e))
 
-async def websocket_handler(websocket, path, config: Config, ws_rate_limiter: RateLimiter, tcp_cache: TCPStateCache, connection_count: callable):
+async def websocket_handler(websocket, path, config: Config, ws_rate_limiter: RateLimiter, tcp_cache: TCPStateCache, connection_counter: ConnectionCounter):
     """Handle WebSocket connections for real-time TCP state updates."""
     client_ip = websocket.remote_address[0]
     logging.info({"message": f"WebSocket client connected", "client_ip": client_ip})
+    connection_counter.add_connection(websocket)
+    
     try:
         if path != "/ws/tcpstates":
             await websocket.send(json.dumps({"error": "Invalid WebSocket path"}))
@@ -293,22 +361,9 @@ async def websocket_handler(websocket, path, config: Config, ws_rate_limiter: Ra
         logging.info({"message": f"WebSocket connection closed", "client_ip": client_ip})
     except Exception as e:
         logging.error({"message": f"WebSocket error for {client_ip}", "error": str(e)})
+        await websocket.send(json.dumps({"error": "Internal server error"}))
     finally:
-        connection_count.decrement()
-
-class ConnectionCounter:
-    """Track active WebSocket connections."""
-    def __init__(self):
-        self.count = 0
-
-    def increment(self):
-        self.count += 1
-
-    def decrement(self):
-        self.count = max(0, self.count - 1)
-
-    def get_count(self):
-        return self.count
+        connection_counter.remove_connection(websocket)
 
 def configure_logging():
     """Configure logging with rotation and dual JSON/human-readable output."""
@@ -344,15 +399,20 @@ def configure_logging():
     logger.addHandler(stream_handler)
     logger.addHandler(file_handler)
 
-async def shutdown(http_server, ws_server, timeout=5):
+async def shutdown(http_server, ws_server, connection_counter, timeout=5):
     """Gracefully shut down servers with a timeout."""
     logger = logging.getLogger(__name__)
     logger.info({"message": "Initiating server shutdown"})
+    
+    # Close all WebSocket connections
+    connection_counter.close_all()
+    
     ws_server.close()
     try:
         await asyncio.wait_for(ws_server.wait_closed(), timeout=timeout)
     except asyncio.TimeoutError:
         logger.warning({"message": f"WebSocket server shutdown timed out after {timeout} seconds"})
+    
     http_server.shutdown()
     http_server.server_close()
     logger.info({"message": "Server shutdown complete"})
@@ -378,7 +438,7 @@ async def run_server():
                 rate_limiter=http_rate_limiter,
                 server_start_time=server_start_time,
                 tcp_cache=tcp_cache,
-                ws_connection_count=connection_counter.get_count,
+                connection_counter=connection_counter,
                 **kwargs
             )
         
@@ -402,7 +462,7 @@ async def run_server():
             await asyncio.gather(http_task)
         except KeyboardInterrupt:
             logger.info({"message": "Server received shutdown signal"})
-            await shutdown(http_server, ws_server)
+            await shutdown(http_server, ws_server, connection_counter)
     except Exception as e:
         logger.critical({"message": "Server failure", "error": str(e)})
         return 1
