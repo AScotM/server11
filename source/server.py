@@ -7,7 +7,6 @@ import asyncio
 import websockets
 import psutil
 from dataclasses import dataclass, field
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List, Set, Any
 from collections import defaultdict
@@ -16,7 +15,8 @@ from logging.handlers import RotatingFileHandler
 import re
 import ssl
 from enum import Enum
-import signal
+import signal  # Added missing import
+from aiohttp import web
 
 class LogLevel(Enum):
     DEBUG = "DEBUG"
@@ -200,92 +200,62 @@ class ConnectionManager:
                 await ws.close(code=1001, reason="Server shutdown")
             self.connections.clear()
 
-class TCPMonitoringHandler(SimpleHTTPRequestHandler):
-    def __init__(self, *args, config: ServerConfig, security: SecurityConfig, 
-                 rate_limiter: RateLimiter, server_start_time: float, 
-                 tcp_cache: TCPStateCache, connection_manager: ConnectionManager, **kwargs):
+class HTTPServer:
+    def __init__(self, config: ServerConfig, security: SecurityConfig, 
+                 rate_limiter: RateLimiter, server_start_time: float,
+                 tcp_cache: TCPStateCache, connection_manager: ConnectionManager):
         self.config = config
         self.security = security
         self.rate_limiter = rate_limiter
         self.server_start_time = server_start_time
         self.tcp_cache = tcp_cache
         self.connection_manager = connection_manager
-        super().__init__(*args, directory=str(self.config.static_dir), **kwargs)
+        self.app = web.Application()
+        self.runner = None
+        self.site = None
+        self._setup_routes()
 
-    def _check_ip_allowlist(self) -> bool:
+    def _setup_routes(self):
+        self.app.router.add_get('/tcpstates', self.handle_tcp_states)
+        self.app.router.add_get('/health', self.handle_health_check)
+        self.app.router.add_get('/metrics', self.handle_metrics)
+        self.app.router.add_get('/ws/info', self.handle_ws_info)
+        self.app.router.add_static('/', self.config.static_dir)
+
+    async def _check_ip_allowlist(self, request: web.Request) -> bool:
         if not self.security.allowed_ips:
             return True
-        return self.client_address[0] in self.security.allowed_ips
+        client_ip = request.remote
+        return client_ip in self.security.allowed_ips
 
-    def _send_response(self, content: bytes, content_type: str = "application/json", status: int = 200):
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(content)))
-        self.send_header("Access-Control-Allow-Origin", self.security.cors_origin)
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "DENY")
-        self.send_header("X-XSS-Protection", "1; mode=block")
-        self.send_header("Cache-Control", "no-store, no-cache")
-        self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-        self.end_headers()
-        self.wfile.write(content)
+    async def handle_tcp_states(self, request: web.Request):
+        if not await self._check_ip_allowlist(request):
+            return web.json_response({"error": "Forbidden", "details": "IP address not allowed"}, status=403)
 
-    def _send_error_response(self, status: int, message: str, details: Optional[str] = None):
-        error_data = {
-            "error": message,
-            "status": status,
-            "timestamp": int(time.time()),
-            "details": details or "No additional details available"
-        }
-        self._send_response(json.dumps(error_data).encode("utf-8"), status=status)
+        client_ip = request.remote
+        if not await self.rate_limiter.is_allowed(client_ip, "/tcpstates"):
+            return web.json_response({"error": "Too Many Requests"}, status=429)
 
-    def do_GET(self):
-        asyncio.run(self._handle_request_async())
-
-    async def _handle_request_async(self):
-        try:
-            if not self._check_ip_allowlist():
-                return self._send_error_response(403, "Forbidden", "IP address not allowed")
-
-            endpoint = self.path.split('?', 1)[0] or "/"
-            
-            if not await self.rate_limiter.is_allowed(self.client_address[0], endpoint):
-                return self._send_error_response(429, "Too Many Requests", 
-                    f"Rate limit exceeded: {self.config.rate_limit_requests} requests per {self.config.rate_limit_window} seconds")
-
-            if len(self.path) > 256:
-                return self._send_error_response(414, "Request URI too long")
-
-            if self.path == "/tcpstates":
-                await self._handle_tcp_states()
-            elif self.path == "/health":
-                await self._handle_health_check()
-            elif self.path == "/metrics":
-                await self._handle_metrics()
-            elif self.path == "/ws/info":
-                await self._handle_ws_info()
-            else:
-                self._handle_static()
-
-        except Exception as e:
-            logging.exception(f"Request processing failed for {self.client_address[0]}: {e}")
-            self._send_error_response(500, "Internal server error", str(e))
-
-    async def _handle_tcp_states(self):
         stats = await self.tcp_cache.get_states()
-        response = json.dumps({
+        return web.json_response({
             "timestamp": int(time.time()),
             "tcp_states": stats,
             "server": "TCP Monitoring Service",
             "version": self.config.server_version
-        }).encode("utf-8")
-        self._send_response(response)
+        })
 
-    async def _handle_health_check(self):
+    async def handle_health_check(self, request: web.Request):
+        if not await self._check_ip_allowlist(request):
+            return web.json_response({"error": "Forbidden", "details": "IP address not allowed"}, status=403)
+
+        client_ip = request.remote
+        if not await self.rate_limiter.is_allowed(client_ip, "/health"):
+            return web.json_response({"error": "Too Many Requests"}, status=429)
+
         try:
             stats = await self.tcp_cache.get_states()
             ws_count = await self.connection_manager.get_count()
-            response = json.dumps({
+            return web.json_response({
                 "status": "healthy",
                 "timestamp": int(time.time()),
                 "tcp_connections": sum(stats.values()),
@@ -294,12 +264,18 @@ class TCPMonitoringHandler(SimpleHTTPRequestHandler):
                 "websocket_connections": ws_count,
                 "uptime": int(time.time() - self.server_start_time),
                 "cache_hit": self.tcp_cache.cache is not None
-            }).encode("utf-8")
-            self._send_response(response)
+            })
         except Exception as e:
-            self._send_error_response(503, "Service unavailable", str(e))
+            return web.json_response({"error": "Service unavailable", "details": str(e)}, status=503)
 
-    async def _handle_metrics(self):
+    async def handle_metrics(self, request: web.Request):
+        if not await self._check_ip_allowlist(request):
+            return web.json_response({"error": "Forbidden", "details": "IP address not allowed"}, status=403)
+
+        client_ip = request.remote
+        if not await self.rate_limiter.is_allowed(client_ip, "/metrics"):
+            return web.json_response({"error": "Too Many Requests"}, status=429)
+
         stats = await self.tcp_cache.get_states()
         ws_count = await self.connection_manager.get_count()
         
@@ -326,53 +302,42 @@ class TCPMonitoringHandler(SimpleHTTPRequestHandler):
             f'server_cpu_usage_percent {psutil.cpu_percent(interval=None)}'
         ])
         
-        self._send_response("\n".join(metrics).encode("utf-8"), "text/plain")
+        return web.Response(text="\n".join(metrics), content_type="text/plain")
 
-    async def _handle_ws_info(self):
+    async def handle_ws_info(self, request: web.Request):
+        if not await self._check_ip_allowlist(request):
+            return web.json_response({"error": "Forbidden", "details": "IP address not allowed"}, status=403)
+
+        client_ip = request.remote
+        if not await self.rate_limiter.is_allowed(client_ip, "/ws/info"):
+            return web.json_response({"error": "Too Many Requests"}, status=429)
+
         ws_count = await self.connection_manager.get_count()
-        response = json.dumps({
+        return web.json_response({
             "websocket_connections": ws_count,
             "max_connections": self.connection_manager.max_connections,
             "ws_endpoint": f"ws://{self.config.host}:{self.config.ws_port}/ws/tcpstates"
-        }).encode("utf-8")
-        self._send_response(response)
+        })
 
-    def _handle_static(self):
-        try:
-            path = self.path.split('?', 1)[0].split('#', 1)[0]
-            
-            if path == '/':
-                path = '/index.html'
-            
-            if not path.startswith('/'):
-                path = '/' + path
-            
-            full_path = self.config.static_dir / path.lstrip('/')
-            full_path = full_path.resolve()
-            
-            static_dir = self.config.static_dir.resolve()
-            try:
-                full_path.relative_to(static_dir)
-            except ValueError:
-                return self._send_error_response(403, "Access denied", "Path traversal attempt detected")
-            
-            if full_path.is_dir():
-                full_path = full_path / "index.html"
-                if not full_path.is_file():
-                    return self._send_error_response(404, "File not found", "Directory index not available")
-            
-            if not full_path.is_file():
-                return self._send_error_response(404, "File not found", f"Requested path: {self.path}")
-            
-            self.path = str(full_path.relative_to(static_dir))
-            super().do_GET()
-            
-        except Exception as e:
-            logging.error(f"Static file handling error for {self.client_address[0]}: {e}")
-            self._send_error_response(500, "Internal server error", str(e))
+    async def start(self):
+        self.runner = web.AppRunner(self.app)
+        await self.runner.setup()
+        
+        ssl_context = None
+        if self.security.ssl_cert_file and self.security.ssl_key_file:
+            ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            ssl_context.load_cert_chain(self.security.ssl_cert_file, self.security.ssl_key_file)
 
-    def log_message(self, format: str, *args: Any) -> None:
-        logging.info(f"{self.client_address[0]} - {format % args}")
+        self.site = web.TCPSite(self.runner, self.config.host, self.config.port, ssl_context=ssl_context)
+        await self.site.start()
+        logging.info(f"HTTP Server started on http://{self.config.host}:{self.config.port}")
+
+    async def stop(self):
+        if self.site:
+            await self.site.stop()
+        if self.runner:
+            await self.runner.cleanup()
+        logging.info("HTTP server stopped")
 
 async def websocket_handler(websocket, path, config: ServerConfig, security: SecurityConfig, 
                           ws_rate_limiter: RateLimiter, tcp_cache: TCPStateCache, 
@@ -458,23 +423,16 @@ class ServerManager:
         self.http_rate_limiter = RateLimiter(rate_config.http_requests, rate_config.http_window)
         self.ws_rate_limiter = RateLimiter(rate_config.ws_requests, rate_config.ws_window)
         self.server_start_time = time.time()
-        self.shutdown_event = asyncio.Event()
 
     async def start_servers(self):
-        def handler_factory(*args, **kwargs):
-            return TCPMonitoringHandler(
-                *args, 
-                config=self.config, 
-                security=self.security,
-                rate_limiter=self.http_rate_limiter,
-                server_start_time=self.server_start_time,
-                tcp_cache=self.tcp_cache,
-                connection_manager=self.connection_manager,
-                **kwargs
-            )
+        # Start HTTP server
+        self.http_server = HTTPServer(
+            self.config, self.security, self.http_rate_limiter,
+            self.server_start_time, self.tcp_cache, self.connection_manager
+        )
+        await self.http_server.start()
         
-        self.http_server = ThreadingHTTPServer((self.config.host, self.config.port), handler_factory)
-        
+        # Start WebSocket server
         ssl_context = None
         if self.security.ssl_cert_file and self.security.ssl_key_file:
             ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -491,7 +449,6 @@ class ServerManager:
             ping_timeout=60
         )
         
-        logging.info(f"HTTP Server started on http://{self.config.host}:{self.config.port}")
         logging.info(f"WebSocket Server started on ws://{self.config.host}:{self.config.ws_port}")
         if ssl_context:
             logging.info(f"SSL/TLS enabled for WebSocket connections")
@@ -499,33 +456,24 @@ class ServerManager:
     async def shutdown(self):
         logging.info("Initiating server shutdown")
         
+        # Shutdown WebSocket server first
         if self.ws_server:
+            logging.info("Shutting down WebSocket server...")
             self.ws_server.close()
-            await self.ws_server.wait_closed()
+            await asyncio.wait_for(self.ws_server.wait_closed(), timeout=self.config.shutdown_timeout)
+            logging.info("WebSocket server shut down")
         
+        # Close all WebSocket connections
+        logging.info("Closing WebSocket connections...")
         await self.connection_manager.close_all()
         
+        # Shutdown HTTP server
         if self.http_server:
-            self.http_server.shutdown()
-            self.http_server.server_close()
+            logging.info("Shutting down HTTP server...")
+            await self.http_server.stop()
+            logging.info("HTTP server shut down")
         
         logging.info("Server shutdown complete")
-
-    async def run_forever(self):
-        await self.start_servers()
-        
-        loop = asyncio.get_event_loop()
-        http_task = loop.run_in_executor(None, self.http_server.serve_forever)
-        
-        try:
-            await asyncio.gather(http_task, self._wait_for_shutdown())
-        except KeyboardInterrupt:
-            logging.info("Received shutdown signal")
-        finally:
-            await self.shutdown()
-
-    async def _wait_for_shutdown(self):
-        await self.shutdown_event.wait()
 
 async def main():
     configure_logging()
@@ -540,19 +488,35 @@ async def main():
 
     server_manager = ServerManager(config, security, rate_config)
     
-    def signal_handler(signum, frame):
-        logging.info(f"Received signal {signum}, initiating shutdown")
-        server_manager.shutdown_event.set()
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    # Create shutdown event
+    shutdown_event = asyncio.Event()
+    
+    # Set up signal handlers using asyncio
+    def signal_handler():
+        logging.info("Received shutdown signal")
+        shutdown_event.set()
+    
+    loop = asyncio.get_running_loop()
+    for sig in [signal.SIGINT, signal.SIGTERM]:
+        loop.add_signal_handler(sig, signal_handler)
     
     try:
-        await server_manager.run_forever()
+        await server_manager.start_servers()
+        logging.info("Servers started. Press Ctrl+C to stop.")
+        
+        # Wait for shutdown signal
+        await shutdown_event.wait()
+        logging.info("Shutdown signal received")
+        
+    except KeyboardInterrupt:
+        logging.info("Received KeyboardInterrupt directly")
     except Exception as e:
         logging.critical(f"Server failure: {e}")
         return 1
+    finally:
+        await server_manager.shutdown()
     
+    logging.info("Server stopped successfully")
     return 0
 
 if __name__ == "__main__":
