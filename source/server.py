@@ -67,7 +67,7 @@ class RateLimitConfig:
         if any(x <= 0 for x in [self.http_requests, self.http_window, self.ws_requests, self.ws_window, self.ws_connection_limit]):
             raise ValueError("All rate limit values must be positive")
 
-@dataclass(frozen=True)
+@dataclass
 class ServerConfig:
     host: str = os.getenv("TCP_SERVER_HOST", "0.0.0.0")
     port: int = int(os.getenv("TCP_SERVER_PORT", "3333"))
@@ -95,7 +95,7 @@ class ServerConfig:
                 config_data = json.load(f)
                 for key, value in config_data.items():
                     if hasattr(self, key):
-                        object.__setattr__(self, key, value)
+                        setattr(self, key, value)
         except Exception as e:
             raise ValueError(f"Failed to load config file {self.config_file}: {str(e)}")
 
@@ -132,7 +132,8 @@ class TCPStateCache:
             if self.cache is None or now - self.last_update >= self.cache_duration:
                 self.cache = await self._parse_tcp_states()
                 self.last_update = now
-            return self.cache.copy()
+            # Return a shallow copy to avoid outside mutation
+            return dict(self.cache)
 
     async def _parse_tcp_states(self) -> Dict[str, int]:
         files = []
@@ -153,9 +154,12 @@ class TCPStateCache:
                 with open(file, "r", encoding="utf-8") as f:
                     for line in f.readlines()[1:]:
                         parts = line.strip().split()
-                        if len(parts) < 12 or not re.match(r'^[0-9A-F]{2}$', parts[3]):
+                        # Ensure we have the expected number of parts, and normalize hex case
+                        if len(parts) < 12:
                             continue
-                        state_code = parts[3]
+                        state_code = parts[3].upper()
+                        if not re.match(r'^[0-9A-F]{2}$', state_code):
+                            continue
                         state_name = TCP_STATES.get(state_code, "UNKNOWN")
                         state_count[state_name] += 1
             except Exception as e:
@@ -183,21 +187,38 @@ class ConnectionManager:
         async with self._lock:
             return len(self.connections)
 
+    async def _safe_send(self, ws: websockets.WebSocketServerProtocol, message: str):
+        try:
+            await ws.send(message)
+            return None
+        except websockets.exceptions.ConnectionClosed:
+            return websockets.exceptions.ConnectionClosed
+        except Exception as e:
+            logging.debug(f"Error sending to websocket: {e}")
+            return e
+
     async def broadcast(self, message: str):
+        # Snapshot connections while holding the lock
         async with self._lock:
-            disconnected = set()
-            for ws in self.connections:
-                try:
-                    await ws.send(message)
-                except websockets.exceptions.ConnectionClosed:
-                    disconnected.add(ws)
-            for ws in disconnected:
-                self.connections.discard(ws)
+            conns = set(self.connections)
+        # Send outside the lock concurrently
+        tasks = [self._safe_send(ws, message) for ws in conns]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Remove disconnected connections under the lock
+        async with self._lock:
+            for ws, res in zip(conns, results):
+                if res is not None:
+                    self.connections.discard(ws)
 
     async def close_all(self):
         async with self._lock:
-            for ws in self.connections:
-                await ws.close(code=1001, reason="Server shutdown")
+            conns = set(self.connections)
+        # Close concurrently outside the lock
+        close_tasks = []
+        for ws in conns:
+            close_tasks.append(ws.close(code=1001, reason="Server shutdown"))
+        await asyncio.gather(*close_tasks, return_exceptions=True)
+        async with self._lock:
             self.connections.clear()
 
 class HTTPServer:
@@ -210,7 +231,8 @@ class HTTPServer:
         self.server_start_time = server_start_time
         self.tcp_cache = tcp_cache
         self.connection_manager = connection_manager
-        self.app = web.Application()
+        # Use security.max_request_size to configure aiohttp
+        self.app = web.Application(client_max_size=self.security.max_request_size)
         self.runner = None
         self.site = None
         self._setup_routes()
@@ -220,11 +242,13 @@ class HTTPServer:
         self.app.router.add_get('/health', self.handle_health_check)
         self.app.router.add_get('/metrics', self.handle_metrics)
         self.app.router.add_get('/ws/info', self.handle_ws_info)
-        self.app.router.add_static('/', self.config.static_dir)
+        # Serve static files under /static to avoid colliding with API routes
+        self.app.router.add_static('/static/', path=str(self.config.static_dir), name='static')
 
     async def _check_ip_allowlist(self, request: web.Request) -> bool:
         if not self.security.allowed_ips:
             return True
+        # Consider X-Forwarded-For behind proxies if desired
         client_ip = request.remote
         return client_ip in self.security.allowed_ips
 
@@ -313,10 +337,11 @@ class HTTPServer:
             return web.json_response({"error": "Too Many Requests"}, status=429)
 
         ws_count = await self.connection_manager.get_count()
+        scheme = "wss" if (self.security.ssl_cert_file and self.security.ssl_key_file) else "ws"
         return web.json_response({
             "websocket_connections": ws_count,
             "max_connections": self.connection_manager.max_connections,
-            "ws_endpoint": f"ws://{self.config.host}:{self.config.ws_port}/ws/tcpstates"
+            "ws_endpoint": f"{scheme}://{self.config.host}:{self.config.ws_port}/ws/tcpstates"
         })
 
     async def start(self):
@@ -325,12 +350,14 @@ class HTTPServer:
         
         ssl_context = None
         if self.security.ssl_cert_file and self.security.ssl_key_file:
-            ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            # Use server-style SSLContext for aiohttp
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ssl_context.load_cert_chain(self.security.ssl_cert_file, self.security.ssl_key_file)
 
         self.site = web.TCPSite(self.runner, self.config.host, self.config.port, ssl_context=ssl_context)
         await self.site.start()
-        logging.info(f"HTTP Server started on http://{self.config.host}:{self.config.port}")
+        scheme = "https" if ssl_context else "http"
+        logging.info(f"HTTP Server started on {scheme}://{self.config.host}:{self.config.port}")
 
     async def stop(self):
         if self.site:
@@ -342,28 +369,36 @@ class HTTPServer:
 async def websocket_handler(websocket, path, config: ServerConfig, security: SecurityConfig, 
                           ws_rate_limiter: RateLimiter, tcp_cache: TCPStateCache, 
                           connection_manager: ConnectionManager):
-    client_ip = websocket.remote_address[0]
+    client_ip = websocket.remote_address[0] if websocket.remote_address else "unknown"
     logging.info(f"WebSocket client connected from {client_ip}")
     
+    # Ensure connections count is kept accurate
     if not await connection_manager.add_connection(websocket):
-        await websocket.close(code=1013, reason="Too many connections")
+        try:
+            await websocket.close(code=1013, reason="Too many connections")
+        except Exception:
+            pass
         return
 
     try:
         if path != "/ws/tcpstates":
             await websocket.send(json.dumps({"error": "Invalid WebSocket path"}))
+            await websocket.close(code=1008, reason="Invalid path")
             return
         
         auth_token = websocket.request_headers.get("Authorization")
         if auth_token != f"Bearer {security.ws_auth_token}":
             await websocket.send(json.dumps({"error": "Unauthorized", "details": "Invalid or missing auth token"}))
+            await websocket.close(code=1008, reason="Unauthorized")
             return
         
         if not await ws_rate_limiter.is_allowed(client_ip, path):
+            # Use ws_rate_limiter attributes for message (the RateLimiter stores them)
             await websocket.send(json.dumps({
                 "error": "Too Many Requests",
-                "details": f"WebSocket rate limit exceeded: {config.ws_rate_limit_requests} connections per {config.ws_rate_limit_window} seconds"
+                "details": f"WebSocket rate limit exceeded: {ws_rate_limiter.requests} connections per {ws_rate_limiter.window} seconds"
             }))
+            await websocket.close(code=1013, reason="Rate limit exceeded")
             return
         
         await websocket.send(json.dumps({"type": "connected", "message": "WebSocket connection established"}))
@@ -385,14 +420,20 @@ async def websocket_handler(websocket, path, config: ServerConfig, security: Sec
         logging.error(f"WebSocket error for {client_ip}: {e}")
         try:
             await websocket.send(json.dumps({"error": "Internal server error", "type": "error"}))
-        except:
+        except Exception:
             pass
     finally:
         await connection_manager.remove_connection(websocket)
 
 def configure_logging(log_level: LogLevel = LogLevel.INFO):
     logger = logging.getLogger()
-    logger.setLevel(log_level.value)
+    # Remove existing handlers to avoid duplicate outputs if reconfiguring
+    if logger.handlers:
+        for h in list(logger.handlers):
+            logger.removeHandler(h)
+
+    # log_level may be LogLevel; setLevel accepts string names
+    logger.setLevel(log_level.value if isinstance(log_level, LogLevel) else str(log_level))
     
     formatter = logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -449,7 +490,8 @@ class ServerManager:
             ping_timeout=60
         )
         
-        logging.info(f"WebSocket Server started on ws://{self.config.host}:{self.config.ws_port}")
+        scheme = "wss" if ssl_context else "ws"
+        logging.info(f"WebSocket Server started on {scheme}://{self.config.host}:{self.config.ws_port}")
         if ssl_context:
             logging.info(f"SSL/TLS enabled for WebSocket connections")
 
@@ -460,7 +502,10 @@ class ServerManager:
         if self.ws_server:
             logging.info("Shutting down WebSocket server...")
             self.ws_server.close()
-            await asyncio.wait_for(self.ws_server.wait_closed(), timeout=self.config.shutdown_timeout)
+            try:
+                await asyncio.wait_for(self.ws_server.wait_closed(), timeout=self.config.shutdown_timeout)
+            except asyncio.TimeoutError:
+                logging.warning("Timeout while waiting for WebSocket server to close")
             logging.info("WebSocket server shut down")
         
         # Close all WebSocket connections
@@ -476,10 +521,13 @@ class ServerManager:
         logging.info("Server shutdown complete")
 
 async def main():
-    configure_logging()
+    # Configure minimal logging early; we reconfigure after loading configs to pick up user-specified level
+    configure_logging(LogLevel.INFO)
     
     try:
         config = ServerConfig()
+        # Reconfigure logging with configured level (this avoids losing config log level)
+        configure_logging(config.log_level)
         security = SecurityConfig()
         rate_config = RateLimitConfig()
     except ValueError as e:
@@ -498,7 +546,11 @@ async def main():
     
     loop = asyncio.get_running_loop()
     for sig in [signal.SIGINT, signal.SIGTERM]:
-        loop.add_signal_handler(sig, signal_handler)
+        try:
+            loop.add_signal_handler(sig, signal_handler)
+        except NotImplementedError:
+            # Some platforms (notably certain Windows configurations) don't support add_signal_handler
+            logging.debug(f"Signal handlers not supported for {sig} on this platform")
     
     try:
         await server_manager.start_servers()
